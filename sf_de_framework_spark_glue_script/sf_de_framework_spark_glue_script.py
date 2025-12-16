@@ -1149,7 +1149,7 @@ def explode_arrays(df, explode_arrays_of_structs=True, join_primitive_arrays=Fal
             # keep arrays as-is (no explode) — return unchanged for primitive arrays
     return df, False
 
-def normalize_nested_json(df,
+def normalize_nested_stjson(df,
                           explode_arrays_of_structs=True,
                           join_primitive_arrays=False,
                           max_iters=20):
@@ -1462,7 +1462,7 @@ def copy_parse_dedupe(spark, md, s3_staging_dir=None):
                 df = spark.read.option("multiline", multiline_flag).json(rdd)
 
                 # run normalization (flatten structs and explode arrays progressively)
-                df = normalize_nested_json(df)
+                df = normalize_nested_stjson(df)
             
                 # show result (use show(truncate=False) to inspect full values)
                 logger.info(f"After normalizing JSON, columns: {df.columns}")
