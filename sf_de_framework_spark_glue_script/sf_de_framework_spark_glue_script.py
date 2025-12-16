@@ -1750,6 +1750,7 @@ def copy_parse_dedupe(spark, md, s3_staging_dir=None):
                             _inject_token_into_headers(new_token)
                             authType = _map_auth_type()
                             logger.info("[RESTAPI] Token refresh succeeded; retrying API call.")
+                            print(new_token)
                             # retry loop continues
                             continue
                         else:
