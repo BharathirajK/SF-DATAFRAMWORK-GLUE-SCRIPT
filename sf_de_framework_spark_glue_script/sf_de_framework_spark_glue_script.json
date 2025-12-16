@@ -1,0 +1,44 @@
+{
+  "name" : "sf_de_framework_spark_glue_script",
+  "jobMode" : "SCRIPT",
+  "description" : "",
+  "role" : "arn:aws:iam::440897580919:role/ut_de_framework_glue_role",
+  "executionProperty" : {
+    "maxConcurrentRuns" : 1
+  },
+  "command" : {
+    "name" : "glueetl",
+    "scriptLocation" : "s3://aws-glue-assets-440897580919-us-west-2/scripts/sf_de_framework_spark_glue_script.py",
+    "pythonVersion" : "3"
+  },
+  "defaultArguments" : {
+    "--conf spark.driver.userClassPathFirst" : "true",
+    "--enable-glue-datacatalog" : "true",
+    "--job-bookmark-option" : "job-bookmark-disable",
+    "--TempDir" : "s3://aws-glue-assets-440897580919-us-west-2/temporary/",
+    "--extra-jars" : "s3://sf-de-framework-bucket/jdbc_drivers/ngdbc-2.25.13.jar,s3://sf-de-framework-bucket/glue_jars/spark-salesforce_2.12-1.1.4.jar,s3://sf-de-framework-bucket/glue_jars/salesforce-wave-api-1.0.10.jar,s3://sf-de-framework-bucket/glue_jars/force-wsc-40.0.0.jar,s3://sf-de-framework-bucket/glue_jars/force-partner-api-40.0.0.jar,s3://sf-de-framework-bucket/glue_jars/jackson-dataformat-xml-2.4.4.jar,s3://sf-de-framework-bucket/glue_jars/woodstox-core-asl-4.4.0.jar,s3://sf-de-framework-bucket/glue_jars/stax2-api-3.1.4.jar,s3://sf-de-framework-bucket/glue_jars/commons-logging-1.2.jar,s3://sf-de-framework-bucket/glue_jars/commons-codec-1.11.jar,s3://sf-de-framework-bucket/glue_jars/httpclient-4.5.13.jar,s3://sf-de-framework-bucket/glue_jars/httpcore-4.4.13.jar,s3://sf-de-framework-bucket/glue_jars/ojdbc8-23.9.0.25.07.jar",
+    "--python-modules-installer-option" : "--only-binary=:all: --no-cache-dir",
+    "--conf spark.executor.userClassPathFirst" : "true",
+    "--enable-metrics" : "true",
+    "--user-jars-first" : "true",
+    "--spark-event-logs-path" : "s3://aws-glue-assets-440897580919-us-west-2/sparkHistoryLogs/",
+    "--enable-job-insights" : "true",
+    "--additional-python-modules" : "croniter==1.4.1,pytz==2024.2,snowflake-connector-python==3.15.0,s3://awsus-rs-df-01/libs/paramiko-3.5.0-py3-none-any.whl,openpyxl,azure-storage-blob==12.22.0",
+    "--enable-observability-metrics" : "true",
+    "--job-language" : "python"
+  },
+  "maxRetries" : 0,
+  "allocatedCapacity" : 2,
+  "timeout" : 30,
+  "maxCapacity" : 2.0,
+  "glueVersion" : "5.0",
+  "numberOfWorkers" : 2,
+  "workerType" : "G.1X",
+  "executionClass" : "STANDARD",
+  "sourceControlDetails" : {
+    "provider" : "GITHUB",
+    "repository" : "SF-DATAFRAMWORK-GLUE-SCRIPT",
+    "branch" : "main",
+    "folder" : "sf_de_framework_spark_glue_script"
+  }
+}
