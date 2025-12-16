@@ -7,6 +7,7 @@ Configuration tables used for file options:
   - CONFIG.PIPELINEPROPERTIES (formerly CUSTOMCONFIG)
   - CONFIG.SYSTEMPROPERTIES (new) for static values / runtime tuning
   - Github Integration completed
+  - Test
 """
 
 from awsglue.transforms import *
