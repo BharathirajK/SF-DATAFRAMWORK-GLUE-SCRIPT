@@ -7,7 +7,6 @@ Configuration tables used for file options:
   - CONFIG.PIPELINEPROPERTIES (formerly CUSTOMCONFIG)
   - CONFIG.SYSTEMPROPERTIES (new) for static values / runtime tuning
   - Github Integration completed
-  - Test
 """
 
 from awsglue.transforms import *
@@ -1655,21 +1654,26 @@ def copy_parse_dedupe(spark, md, s3_staging_dir=None):
                         return
                     auth_scheme = (cfg.get("auth_scheme") or "Bearer").upper()
                     if auth_scheme == "JWT":
-                        headers.setdefault("Authorization", f"JWT {token_value}")
+                        #headers.setdefault("Authorization", f"JWT {token_value}")
+                        headers["Authorization"] = f"JWT {token_value}"
                     elif auth_scheme in ("BEARER", "OAUTH", "OAUTHTOKEN"):
-                        headers.setdefault("Authorization", f"Bearer {token_value}")
+                        #headers.setdefault("Authorization", f"Bearer {token_value}")
+                        headers["Authorization"] = f"Bearer {token_value}"
                     elif auth_scheme == "API_KEY":
                         # allow custom api_key_header in cfg or secret; fallback to x-api-key
                         api_key_header = cfg.get("api_key_header") or (cfg.get("_secret_content") or {}).get("api_key_header") or "x-api-key"
-                        headers.setdefault(api_key_header, token_value)
+                        #headers.setdefault(api_key_header, token_value)
+                        headers[api_key_header] = token_value
                     else:
                         # support passing raw header name (e.g., "X-Auth-Token") if auth_scheme is not standard
                         if isinstance(cfg.get("auth_scheme"), str) and ":" in cfg.get("auth_scheme"):
                             # format "HeaderName:SCHEME" not common but keep fallback
                             hdr = cfg.get("auth_scheme").split(":", 1)[0].strip()
-                            headers.setdefault(hdr, token_value)
+                            #headers.setdefault(hdr, token_value)
+                            headers[hdr] = token_value
                         else:
-                            headers.setdefault("Authorization", f"Bearer {token_value}")
+                            #headers.setdefault("Authorization", f"Bearer {token_value}")
+                            headers["Authorization"] = f"Bearer {token_value}"
             
                 # initial resolution/injection
                 token_value = _resolve_token()
@@ -2065,7 +2069,6 @@ def copy_parse_dedupe(spark, md, s3_staging_dir=None):
 
     return df, df_dedup, unique_keys
 
-
 # ===== JDBC URL BUILDER SECTION =====
 def build_jdbc_url(source_type, secret):
     host = secret["host"]
@@ -2181,6 +2184,126 @@ def build_jdbc_url(source_type, secret):
 
     logger.info(f"Constructed JDBC URL: {url} with driver: {driver}")
     return url, driver
+
+# ===== TRANSFORMATION RULES LOADING SECTION =====
+def load_transform_rules(spark, sf_options, pipeline_id, table_name):
+    df = spark.read.format("snowflake") \
+        .options(**sf_options) \
+        .option("query", f"""
+            SELECT *
+            FROM {table_name}
+            WHERE PipelineId = '{pipeline_id}'
+              AND OperationType = 'transform'
+              AND Active = TRUE
+        """).load()
+    print("transform table : ")
+    df.show()
+
+    return df.collect()
+    
+def apply_transformations(df, rules):
+    for r in rules:
+        rule = (r["TRANSFORMATIONRULES"] or "").lower()
+        src_cols = [c.strip() for c in (r["OPERATIONCOLUMNS"] or "").split(",") if c]
+        tgt = r["OPERATIONTARGET"] or (src_cols[0] if src_cols else None)
+
+        # --------------------
+        # DROP DUPLICATES
+        # --------------------
+        if rule == "drop_duplicates":
+            df = df.dropDuplicates(src_cols)
+            continue
+
+        # --------------------
+        # TYPE CASTING
+        # --------------------
+        if rule == "to_bool":
+            print("bool convert")
+            df = df.withColumn(tgt, F.col(src_cols[0]).cast("boolean"))
+
+        elif rule == "to_int":
+            df = df.withColumn(tgt, F.col(src_cols[0]).cast("int"))
+
+        elif rule == "to_float":
+            df = df.withColumn(tgt, F.col(src_cols[0]).cast("double"))
+
+        elif rule == "to_datetime":
+            df = df.withColumn(tgt, F.to_timestamp(F.col(src_cols[0])))
+
+        elif rule == "to_varchar":
+            df = df.withColumn(tgt, F.col(src_cols[0]).cast("string"))
+
+        # --------------------
+        # STRING OPERATIONS
+        # --------------------
+        elif rule == "upper":
+            df = df.withColumn(tgt, F.upper(F.col(src_cols[0])))
+
+        elif rule == "lower":
+            df = df.withColumn(tgt, F.lower(F.col(src_cols[0])))
+
+        elif rule == "trim":
+            df = df.withColumn(tgt, F.trim(F.col(src_cols[0])))
+
+        elif rule == "strip":
+            df = df.withColumn(tgt, F.trim(F.col(src_cols[0])))
+
+        elif rule.startswith("fillna:"):
+            default = rule.split(":", 1)[1]
+            df = df.withColumn(tgt, F.coalesce(F.col(src_cols[0]), F.lit(default)))
+
+        elif rule.startswith("regexp_replace:"):
+            pattern, repl = rule.split(":", 1)[1].split(",", 1)
+            df = df.withColumn(tgt, F.regexp_replace(F.col(src_cols[0]), pattern, repl))
+
+        elif rule == "concat":
+            df = df.withColumn(tgt, F.concat_ws("", *[F.col(c) for c in src_cols]))
+
+        elif rule.startswith("split:"):
+            pos = rule.split(":", 1)[1]
+            if pos == "first":
+                df = df.withColumn(tgt, F.split(F.col(src_cols[0]), " ").getItem(0))
+
+        elif rule.startswith("substring:"):
+            start, length = rule.split(":", 1)[1].split(",")
+            df = df.withColumn(tgt, F.substring(F.col(src_cols[0]), int(start)+1, int(length)))
+
+        # --------------------
+        # MATH
+        # --------------------
+        elif rule == "sum":
+            df = df.withColumn(tgt, sum([F.col(c) for c in src_cols]))
+
+        elif rule == "multiply":
+            expr = None
+            for c in src_cols:
+                expr = F.col(c) if expr is None else expr * F.col(c)
+            df = df.withColumn(tgt, expr)
+
+        elif rule.startswith("round:"):
+            scale = int(rule.split(":")[1])
+            df = df.withColumn(tgt, F.round(F.col(src_cols[0]), scale))
+
+        # --------------------
+        # MAP
+        # --------------------
+        elif rule.startswith("map:"):
+            raw_map = rule.split(":", 1)[1]
+            mapping = eval(raw_map)  # controlled config table only
+            map_expr = F.create_map([F.lit(x) for x in sum(mapping.items(), ())])
+            df = df.withColumn(tgt, map_expr.getItem(F.col(src_cols[0])))
+
+        # --------------------
+        # SQL TRANSFORM
+        # --------------------
+        elif rule == "sql_update" and r.Query:
+            df.createOrReplaceTempView("src")
+            df = spark.sql(r.Query)
+
+        else:
+            logger.warning(f"[TRANSFORM] Unknown rule skipped: {rule}")
+
+    return df
 
 
 # ===== BRONZE LAYER LOADING SECTION =====
@@ -2537,7 +2660,6 @@ def log_data_ingestion(
         f"Log written to Snowflake: {pipeline_status} with counts – Source: {source_count}, Dest: {destination_count}"
     )
 
-
 # ===== MASTER LOG FINALIZATION =====
 def finalize_master_log(secret, master_log_id, master_status, message=None, table_name=None):
     try:
@@ -2570,7 +2692,6 @@ def finalize_master_log(secret, master_log_id, master_status, message=None, tabl
         )
         raise
 
-
 # ===== CRON UPDATE SECTION =====
 def update_cron_next_run(secret, cron_id, cron_expr, tz, table_name):
     """
@@ -2601,7 +2722,6 @@ def update_cron_last_run(secret, cron_id, table_name):
     """
     execute_snowflake_sql(secret, update_sql)
     logger.info(f"Updated LASTRUN for CRONID={cron_id} to {now_utc}")
-
 
 def api_request(
     url,
@@ -3325,6 +3445,20 @@ def main():
                             spark, md, s3_staging_dir=None
                         )
                         logger.info(f"Unique Keys: {unique_keys}")
+                        
+                        validation_table = cfg("VALIDATION")
+                        transform_rules = load_transform_rules(
+                            spark,
+                            sf_options,
+                            md["pipeline"]["PIPELINEID"],
+                            validation_table
+                        )
+                        
+                        dedupe_df = apply_transformations(dedupe_df, transform_rules)
+
+                        logger.info(f"[TRANSFORM] Applied {len(transform_rules)} transformation rules")
+                        dedupe_df.show()
+
                         dest_tbl, before_count = load_bronze(
                             spark,
                             sf_options,
