@@ -1272,15 +1272,12 @@ def copy_parse_dedupe(spark, md, s3_staging_dir=None):
                     for m in md.get("mappings", [])
                 ]
                 mapped_src_cols = [c for c in mapped_src_cols if c]
-                select_cols = (
-                    ", ".join(sorted(set(mapped_src_cols)))
-                    if mapped_src_cols
-                    else "Id"
-                )
+                # ALWAYS include Id even if it's not in mappings
+                select_cols = ", ".join(sorted(set(mapped_src_cols + ["Id"])))
                 soql = f"SELECT {select_cols} FROM {sp_raw}"
                 logger.info(f"Built SOQL for Salesforce read: {soql}")
                 df = reader.option("soql", soql).load()
-
+                
             logger.info("Successfully read data from Salesforce")
 
         # ==== HUBSPOT READER (contacts / companies via REST API) ====
@@ -2232,6 +2229,18 @@ def apply_transformations(df, rules):
 
         elif rule == "to_varchar":
             df = df.withColumn(tgt, F.col(src_cols[0]).cast("string"))
+            
+        elif rule == "to_time":
+            df = df.withColumn(tgt, F.date_format(F.col(src_cols[0]), "HH:mm:ss"))
+        
+        elif rule == "year":
+            df = df.withColumn(tgt, F.year(F.col(src_cols[0])))
+        
+        elif rule == "month_name":
+            df = df.withColumn(tgt, F.date_format(F.col(src_cols[0]), "MMMM"))
+        
+        elif rule == "day_name":
+            df = df.withColumn(tgt, F.date_format(F.col(src_cols[0]), "EEEE"))
 
         # --------------------
         # STRING OPERATIONS
@@ -2267,6 +2276,7 @@ def apply_transformations(df, rules):
         elif rule.startswith("substring:"):
             start, length = rule.split(":", 1)[1].split(",")
             df = df.withColumn(tgt, F.substring(F.col(src_cols[0]), int(start)+1, int(length)))
+        
 
         # --------------------
         # MATH
@@ -2283,6 +2293,18 @@ def apply_transformations(df, rules):
         elif rule.startswith("round:"):
             scale = int(rule.split(":")[1])
             df = df.withColumn(tgt, F.round(F.col(src_cols[0]), scale))
+            
+        elif rule == "subtract":
+            expr = F.col(src_cols[0])
+            for c in src_cols[1:]:
+                expr = expr - F.col(c)
+            df = df.withColumn(tgt, expr)
+        
+        elif rule == "divide":
+            expr = F.col(src_cols[0])
+            for c in src_cols[1:]:
+                expr = expr / F.col(c)
+            df = df.withColumn(tgt, expr)
 
         # --------------------
         # MAP
@@ -2292,6 +2314,37 @@ def apply_transformations(df, rules):
             mapping = eval(raw_map)  # controlled config table only
             map_expr = F.create_map([F.lit(x) for x in sum(mapping.items(), ())])
             df = df.withColumn(tgt, map_expr.getItem(F.col(src_cols[0])))
+            
+        # --------------------
+        # Column copy & delete
+        # --------------------
+        elif rule == "copy":
+            df = df.withColumn(tgt, F.col(src_cols[0]))
+        
+        elif rule == "delete":
+            existing = [c for c in src_cols if c in df.columns]
+            if existing:
+                df = df.drop(*existing)
+                
+        # --------------------
+        # Masking
+        # --------------------
+        elif rule.startswith("mask:"):
+            # example: mask:*,4
+            mask_char, keep = rule.split(":", 1)[1].split(",")
+            keep = int(keep)
+        
+            df = df.withColumn(
+                tgt,
+                F.when(
+                    F.col(src_cols[0]).isNotNull(),
+                    F.concat(
+                        F.substring(F.col(src_cols[0]), 1, keep),
+                        F.expr(f"repeat('{mask_char}', length({src_cols[0]}) - {keep})")
+                    )
+                )
+            )
+
 
         # --------------------
         # SQL TRANSFORM
@@ -2549,6 +2602,119 @@ def load_bronze(
         f"Completed RAW load → {dest_table}. Previous Row Count: {before}"
     )
     return dest_table, before
+
+def archive_source_file_if_required(md):
+    p = md["pipeline"]
+    source_path = md["source"]["SOURCEPATH"]
+    source_type = md["source"]["SOURCE_TYPE"].lower()
+
+    if not p.get("ISARCHIVEAFTERDATARETENTION"):
+        logger.info("[ARCHIVE-FILE] File archive disabled")
+        return
+
+    archive_path = p.get("DATARETENTIONARCHIVEPATH")
+    if not archive_path:
+        logger.warning("[ARCHIVE-FILE] Archive path not provided")
+        return
+
+    file_name = source_path.split("/")[-1]
+    archive_file_path = f"{archive_path.rstrip('/')}/{file_name}"
+
+    logger.info(f"[ARCHIVE-FILE] Archiving file: {source_path} → {archive_file_path}")
+
+    # 1️⃣ AWS S3
+    if source_type in ["awss3", "aws_s3"]:
+        s3 = boto3.client("s3")
+
+        src_bucket, src_key = source_path.replace("s3://", "").split("/", 1)
+        dst_bucket, dst_key = archive_file_path.replace("s3://", "").split("/", 1)
+
+        s3.copy_object(
+            Bucket=dst_bucket,
+            CopySource={"Bucket": src_bucket, "Key": src_key},
+            Key=dst_key
+        )
+        s3.delete_object(Bucket=src_bucket, Key=src_key)
+
+        logger.info("[ARCHIVE-FILE][S3] File archived successfully")
+
+    # 2️⃣ Azure Blob Storage
+    elif source_type in ["azureblob","azure_blob"]:
+        secret_name = md["source"]["SECRET_KEY"]
+        secret = get_secret_cached(secret_name)
+
+        blob_service = BlobServiceClient.from_connection_string(
+            secret["connection_string"]
+        )
+
+        src_container, src_blob = source_path.split("/", 3)[2:]
+        dst_container, dst_blob = archive_file_path.split("/", 3)[2:]
+
+        src_client = blob_service.get_blob_client(
+            container=src_container, blob=src_blob
+        )
+        dst_client = blob_service.get_blob_client(
+            container=dst_container, blob=dst_blob
+        )
+
+        dst_client.start_copy_from_url(src_client.url)
+        src_client.delete_blob()
+
+        logger.info("[ARCHIVE-FILE][AZURE] File archived successfully")
+
+    # 3️⃣ SFTP
+    elif source_type == "sftp":
+        secret_name = md["source"]["SECRET_KEY"]
+        secret = get_secret_cached(md["source"]["SECRET_KEY"])
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            secret["host"],
+            secret.get("port", 22),
+            secret["username"],
+            secret["password"]
+        )
+    
+        sftp = client.open_sftp()
+    
+        # ---- normalize paths ----
+        src_path = source_path.lstrip("/")
+        archive_dir = archive_path.rstrip("/")
+    
+        file_name = os.path.basename(src_path)
+        archive_file_path = f"{archive_dir}/{file_name}"
+    
+        # ---- ensure archive directory exists ----
+        def mkdir_p(path):
+            parts = path.strip("/").split("/")
+            current = ""
+            for p in parts:
+                current += f"/{p}"
+                try:
+                    sftp.stat(current)
+                except IOError:
+                    sftp.mkdir(current)
+    
+        mkdir_p(archive_dir)
+    
+        logger.info(
+            f"[ARCHIVE-FILE][SFTP] Moving {src_path} → {archive_file_path}"
+        )
+    
+        sftp.rename(src_path, archive_file_path)
+    
+        sftp.close()
+        client.close()
+
+        logger.info("[ARCHIVE-FILE][SFTP] File archived successfully")
+
+    # Unsupported
+    else:
+        logger.warning(
+            f"[ARCHIVE-FILE] Unsupported source type for archiving: {source_path}"
+        )
+
 
 # ===== DATA INGESTION LOGGING SECTION =====
 def log_data_ingestion(
@@ -3441,11 +3607,13 @@ def main():
                         break
 
                     if layer in ("bronze", "silver"):
+                        # Extract Data Start
                         source_df, dedupe_df, unique_keys = copy_parse_dedupe(
                             spark, md, s3_staging_dir=None
                         )
                         logger.info(f"Unique Keys: {unique_keys}")
-                        
+                        # Extract Data End
+                        # Validation & Transformation Start
                         validation_table = cfg("VALIDATION")
                         transform_rules = load_transform_rules(
                             spark,
@@ -3458,7 +3626,8 @@ def main():
 
                         logger.info(f"[TRANSFORM] Applied {len(transform_rules)} transformation rules")
                         dedupe_df.show()
-
+                        # Validation & Transformation End
+                        #Load Start
                         dest_tbl, before_count = load_bronze(
                             spark,
                             sf_options,
@@ -3471,6 +3640,15 @@ def main():
                         logger.info(
                             f"{layer.capitalize()} Layer ETL complete for PIPELINEID: {pid}"
                         )
+                        #Load End
+                        try:
+                            if (md["pipeline"].get("ISARCHIVEAFTERDATARETENTION", False)):
+                                logger.info("Archive flag enabled — starting file archive process...")
+                                archive_source_file_if_required(md)
+                            else:
+                                logger.info("Archive not required for this pipeline or unsupported source type.")
+                        except Exception as e:
+                            logger.error(f"File archive process failed: {e}", exc_info=True)
                     else:
                         logger.error(
                             f"Unsupported layer '{layer}' for pipeline {pid}"
